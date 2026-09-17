@@ -3,11 +3,14 @@ Tunova — Telegram Music Bot  @Tunova\_Bot
 Features: search, download MP3, history, favorites, top, language, inline, voice recognition
 """
 import os
+import re
+import json
 import uuid
 import asyncio
 import logging
 import tempfile
 import urllib.request
+import urllib.parse
 
 from dotenv import load_dotenv
 import yt_dlp
@@ -35,7 +38,6 @@ from telegram.constants import ParseMode, ChatAction
 
 import db
 import i18n
-import music_api
 
 load_dotenv()
 
@@ -86,9 +88,97 @@ def _has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+_MUSIC_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,uz;q=0.7",
+}
+
+_TRACK_CACHE = {}
+
+
+def cache_track(track: dict) -> None:
+    if track and "id" in track:
+        _TRACK_CACHE[track["id"]] = track
+
+
+def get_cached_track(track_id: str) -> dict:
+    return _TRACK_CACHE.get(track_id)
+
+
+def search_hitmo(query: str, max_results: int = 5) -> list:
+    """Search music on Hitmo direct MP3 catalog."""
+    domains = [
+        "https://rus.hitmotop.com",
+        "https://eu.hitmotop.com",
+        "https://ru.hitmoz.org",
+    ]
+    encoded_q = urllib.parse.quote(query.strip())
+    for base_domain in domains:
+        try:
+            url = f"{base_domain}/search?q={encoded_q}"
+            req = urllib.request.Request(url, headers=_MUSIC_HEADERS)
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+
+            pattern = r'<li\s+class="[^"]*track[^"]*"[^>]*data-musmeta=\'([^\']+)\'.*?<div class="track__fulltime">([^<]+)</div>'
+            matches = re.findall(pattern, html, re.DOTALL)
+
+            if not matches:
+                matches_meta = re.findall(r"data-musmeta='([^']+)'", html)
+                matches = [(m, "03:00") for m in matches_meta]
+
+            tracks = []
+            for meta_str, dur_str in matches:
+                if len(tracks) >= max_results:
+                    break
+                try:
+                    meta = json.loads(meta_str)
+                    dl_url = meta.get("url", "")
+                    if not dl_url:
+                        continue
+                    if dl_url.startswith("/"):
+                        dl_url = base_domain + dl_url
+
+                    dur_parts = str(dur_str).strip().split(":")
+                    if len(dur_parts) == 2:
+                        duration_sec = int(dur_parts[0]) * 60 + int(dur_parts[1])
+                    elif len(dur_parts) == 3:
+                        duration_sec = int(dur_parts[0]) * 3600 + int(dur_parts[1]) * 60 + int(dur_parts[2])
+                    else:
+                        duration_sec = 0
+
+                    raw_id = str(meta.get("id") or "").replace("track-id-", "").strip()
+                    if not raw_id:
+                        raw_id = uuid.uuid4().hex[:10]
+
+                    track_id = f"hm_{raw_id}"
+
+                    track = {
+                        "id": track_id,
+                        "title": meta.get("title", "Unknown").strip(),
+                        "uploader": meta.get("artist", "Unknown").strip(),
+                        "duration": duration_sec,
+                        "thumbnail": meta.get("img") or "",
+                        "url": dl_url,
+                    }
+                    cache_track(track)
+                    tracks.append(track)
+                except Exception as ex:
+                    logger.debug(f"Error parsing track: {ex}")
+                    continue
+
+            if tracks:
+                return tracks
+        except Exception as e:
+            logger.warning(f"Hitmo search {base_domain} failed: {e}")
+            continue
+    return []
+
+
 def search_music(query: str, max_results: int = MAX_RESULTS) -> list:
     """Primary music search using direct MP3 catalog with YouTube fallback."""
-    tracks = music_api.search_music(query, max_results)
+    tracks = search_hitmo(query, max_results)
     if tracks:
         return tracks
     try:
@@ -126,20 +216,20 @@ def search_youtube(query: str, max_results: int = MAX_RESULTS) -> list:
             "thumbnail": entry.get("thumbnail") or "",
             "url": f"https://www.youtube.com/watch?v={entry.get('id', '')}",
         }
-        music_api.cache_track(track)
+        cache_track(track)
         tracks.append(track)
     return tracks[:max_results]
 
 
 def get_video_info(video_id: str) -> dict:
     """Fetch track metadata by ID (from cache, DB, or YouTube)."""
-    cached = music_api.get_cached_track(video_id)
+    cached = get_cached_track(video_id)
     if cached:
         return cached
 
     for t in db.get_top(limit=100):
         if t["id"] == video_id and t.get("url"):
-            music_api.cache_track(t)
+            cache_track(t)
             return t
 
     url = f"https://www.youtube.com/watch?v={video_id}"
@@ -154,18 +244,46 @@ def get_video_info(video_id: str) -> dict:
             "thumbnail": info.get("thumbnail") or "",
             "url": url,
         }
-        music_api.cache_track(track)
+        cache_track(track)
         return track
     except Exception as e:
         logger.error(f"get_video_info: {e}")
         return {}
 
 
+def download_direct_mp3(url: str, output_dir: str) -> tuple:
+    """Download MP3 directly via streaming HTTP request."""
+    out_path = os.path.join(output_dir, "audio.mp3")
+    parsed = urllib.parse.urlparse(url)
+    referer = f"{parsed.scheme}://{parsed.netloc}/"
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": _MUSIC_HEADERS["User-Agent"],
+            "Referer": referer,
+            "Accept": "*/*",
+        }
+    )
+
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        with open(out_path, "wb") as out_file:
+            while True:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                out_file.write(chunk)
+
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 5000:
+        return out_path, "mp3"
+    return None, None
+
+
 def download_audio(video_url: str, output_dir: str):
     """Download audio. Tries direct MP3 first, then yt-dlp."""
     if video_url.startswith("http") and (".mp3" in video_url or "/get/" in video_url or ("youtube.com" not in video_url and "youtu.be" not in video_url)):
         try:
-            path, ext = music_api.download_direct_mp3(video_url, output_dir)
+            path, ext = download_direct_mp3(video_url, output_dir)
             if path and os.path.exists(path):
                 return path, ext
         except Exception as e:
@@ -322,7 +440,7 @@ async def do_download(
 
     # Cache track for favorites toggle
     context.user_data.setdefault("tracks", {})[track["id"]] = track
-    music_api.cache_track(track)
+    cache_track(track)
 
     # ── Start loading animation ───────────────
     stop_event  = asyncio.Event()
@@ -489,7 +607,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         track_url = track.get("url") or (f"https://www.youtube.com/watch?v={track['id']}" if not str(track['id']).startswith("hm_") else "")
         track_data = {**track, "url": track_url}
         context.user_data.setdefault("tracks", {})[track["id"]] = track_data
-        music_api.cache_track(track_data)
+        cache_track(track_data)
         row.append(InlineKeyboardButton(f"▶️ {idx}", callback_data=f"hd:{track['id']}"))
         if len(row) == 5:
             buttons.append(row); row = []
@@ -526,10 +644,10 @@ async def _send_favorites(msg_or_query, context, user_id: int, lang: str, edit: 
         track_url = track.get("url") or (f"https://www.youtube.com/watch?v={track['id']}" if not str(track['id']).startswith("hm_") else "")
         track_data = {**track, "url": track_url}
         context.user_data.setdefault("tracks", {})[track["id"]] = track_data
-        music_api.cache_track(track_data)
+        cache_track(track_data)
         label = track["title"][:28] + "…" if len(track["title"]) > 28 else track["title"]
         buttons.append([
-            InlineKeyboardButton(f"▶️ {idx}. {label}", callback_data=f"fd:{track['id']}"),
+            InlineKeyboardButton(f"▶️ {idx}. {label}", callback_data=f"fd:{track['id']}") ,
             InlineKeyboardButton("💔", callback_data=f"fr:{track['id']}"),
         ])
 
@@ -559,7 +677,7 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         track_url = t.get("url") or (f"https://www.youtube.com/watch?v={t['id']}" if not str(t['id']).startswith("hm_") else "")
         track_data = {**t, "url": track_url}
         context.user_data.setdefault("tracks", {})[t["id"]] = track_data
-        music_api.cache_track(track_data)
+        cache_track(track_data)
         
         # Add inline button for download
         buttons.append(InlineKeyboardButton(str(idx), callback_data=f"hd:{t['id']}"))
@@ -801,7 +919,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if tracks:
         track = tracks[0]
         context.user_data.setdefault("tracks", {})[track["id"]] = track
-        music_api.cache_track(track)
+        cache_track(track)
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton(i18n.t(lang, "download_btn"), callback_data=f"dl:{track['id']}")
         ]])
