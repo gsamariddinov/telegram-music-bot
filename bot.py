@@ -35,6 +35,7 @@ from telegram.constants import ParseMode, ChatAction
 
 import db
 import i18n
+import music_api
 
 load_dotenv()
 
@@ -85,7 +86,20 @@ def _has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def search_music(query: str, max_results: int = MAX_RESULTS) -> list:
+    """Primary music search using direct MP3 catalog with YouTube fallback."""
+    tracks = music_api.search_music(query, max_results)
+    if tracks:
+        return tracks
+    try:
+        return search_youtube(query, max_results)
+    except Exception as e:
+        logger.warning(f"YouTube fallback search failed: {e}")
+        return []
+
+
 def search_youtube(query: str, max_results: int = MAX_RESULTS) -> list:
+    """Fallback search on YouTube."""
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -104,24 +118,35 @@ def search_youtube(query: str, max_results: int = MAX_RESULTS) -> list:
         duration = entry.get("duration")
         if duration and int(duration) > MAX_DURATION:
             continue
-        tracks.append({
+        track = {
             "id":       entry.get("id", ""),
             "title":    entry.get("title", "Unknown"),
             "uploader": entry.get("uploader") or entry.get("channel") or "Unknown",
             "duration": duration,
             "thumbnail": entry.get("thumbnail") or "",
             "url": f"https://www.youtube.com/watch?v={entry.get('id', '')}",
-        })
+        }
+        music_api.cache_track(track)
+        tracks.append(track)
     return tracks[:max_results]
 
 
 def get_video_info(video_id: str) -> dict:
-    """Fetch single video metadata by ID (used for deep links)."""
+    """Fetch track metadata by ID (from cache, DB, or YouTube)."""
+    cached = music_api.get_cached_track(video_id)
+    if cached:
+        return cached
+
+    for t in db.get_top(limit=100):
+        if t["id"] == video_id and t.get("url"):
+            music_api.cache_track(t)
+            return t
+
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
         with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "extractor_args": {"youtube": ["player_client=android"]}}) as ydl:
             info = ydl.extract_info(url, download=False)
-        return {
+        track = {
             "id":       video_id,
             "title":    info.get("title", "Unknown"),
             "uploader": info.get("uploader") or info.get("channel") or "Unknown",
@@ -129,13 +154,23 @@ def get_video_info(video_id: str) -> dict:
             "thumbnail": info.get("thumbnail") or "",
             "url": url,
         }
+        music_api.cache_track(track)
+        return track
     except Exception as e:
         logger.error(f"get_video_info: {e}")
         return {}
 
 
 def download_audio(video_url: str, output_dir: str):
-    """Download best audio. Returns (path, ext) tuple."""
+    """Download audio. Tries direct MP3 first, then yt-dlp."""
+    if video_url.startswith("http") and (".mp3" in video_url or "/get/" in video_url or ("youtube.com" not in video_url and "youtu.be" not in video_url)):
+        try:
+            path, ext = music_api.download_direct_mp3(video_url, output_dir)
+            if path and os.path.exists(path):
+                return path, ext
+        except Exception as e:
+            logger.warning(f"Direct download failed: {e}, falling back to yt_dlp")
+
     has_ffmpeg = _has_ffmpeg()
     logger.info(f"ffmpeg: {has_ffmpeg}")
 
@@ -177,6 +212,7 @@ def download_audio(video_url: str, output_dir: str):
             return fp, fext
 
     return None, None
+
 
 
 async def animate_loading(
@@ -269,11 +305,24 @@ async def do_download(
     """
     title       = track["title"]
     uploader    = track.get("uploader", "Unknown")
-    duration_s  = fmt_duration(track.get("duration"))
-    url         = track.get("url") or f"https://www.youtube.com/watch?v={track['id']}"
+    url = track.get("url")
+    if not url:
+        if track.get("id", "").startswith("hm_"):
+            found = search_music(f"{uploader} {title}", 1)
+            if found:
+                url = found[0].get("url")
+                track["url"] = url
+        else:
+            url = f"https://www.youtube.com/watch?v={track['id']}"
+
+    if not url:
+        stop_event = asyncio.Event()
+        await message.edit_text(i18n.t(lang, "file_not_found"))
+        return
 
     # Cache track for favorites toggle
     context.user_data.setdefault("tracks", {})[track["id"]] = track
+    music_api.cache_track(track)
 
     # ── Start loading animation ───────────────
     stop_event  = asyncio.Event()
@@ -437,9 +486,10 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     for idx, track in enumerate(tracks, 1):
         dur = fmt_duration(track["duration"])
         text += i18n.t(lang, "track_num", idx, track["title"][:40], track["uploader"][:25], dur, track.get("count", 1))
-        context.user_data.setdefault("tracks", {})[track["id"]] = {
-            **track, "url": f"https://www.youtube.com/watch?v={track['id']}"
-        }
+        track_url = track.get("url") or (f"https://www.youtube.com/watch?v={track['id']}" if not str(track['id']).startswith("hm_") else "")
+        track_data = {**track, "url": track_url}
+        context.user_data.setdefault("tracks", {})[track["id"]] = track_data
+        music_api.cache_track(track_data)
         row.append(InlineKeyboardButton(f"▶️ {idx}", callback_data=f"hd:{track['id']}"))
         if len(row) == 5:
             buttons.append(row); row = []
@@ -473,9 +523,10 @@ async def _send_favorites(msg_or_query, context, user_id: int, lang: str, edit: 
     for idx, track in enumerate(tracks, 1):
         dur = fmt_duration(track["duration"])
         text += i18n.t(lang, "track_num", idx, track["title"][:40], track["uploader"][:25], dur, track.get("count", 0))
-        context.user_data.setdefault("tracks", {})[track["id"]] = {
-            **track, "url": f"https://www.youtube.com/watch?v={track['id']}"
-        }
+        track_url = track.get("url") or (f"https://www.youtube.com/watch?v={track['id']}" if not str(track['id']).startswith("hm_") else "")
+        track_data = {**track, "url": track_url}
+        context.user_data.setdefault("tracks", {})[track["id"]] = track_data
+        music_api.cache_track(track_data)
         label = track["title"][:28] + "…" if len(track["title"]) > 28 else track["title"]
         buttons.append([
             InlineKeyboardButton(f"▶️ {idx}. {label}", callback_data=f"fd:{track['id']}"),
@@ -505,7 +556,10 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         dur = fmt_duration(t["duration"])
         text += i18n.t(lang, "track_num", idx, t["title"][:40], t["uploader"][:25], dur, t.get("count", 1))
         # Add to local cache so user can download from top
-        context.user_data.setdefault("tracks", {})[t["id"]] = t
+        track_url = t.get("url") or (f"https://www.youtube.com/watch?v={t['id']}" if not str(t['id']).startswith("hm_") else "")
+        track_data = {**t, "url": track_url}
+        context.user_data.setdefault("tracks", {})[t["id"]] = track_data
+        music_api.cache_track(track_data)
         
         # Add inline button for download
         buttons.append(InlineKeyboardButton(str(idx), callback_data=f"hd:{t['id']}"))
@@ -669,7 +723,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     loop = asyncio.get_event_loop()
     try:
-        tracks = await loop.run_in_executor(None, search_youtube, query)
+        tracks = await loop.run_in_executor(None, search_music, query)
     except Exception as e:
         logger.error(f"Search error: {e}", exc_info=True)
         await searching_msg.edit_text(i18n.t(lang, "search_error"))
@@ -740,13 +794,14 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = f"{artist} {song}"
     loop = asyncio.get_event_loop()
     try:
-        tracks = await loop.run_in_executor(None, search_youtube, query, 1)
+        tracks = await loop.run_in_executor(None, search_music, query, 1)
     except Exception:
         tracks = []
         
     if tracks:
         track = tracks[0]
         context.user_data.setdefault("tracks", {})[track["id"]] = track
+        music_api.cache_track(track)
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton(i18n.t(lang, "download_btn"), callback_data=f"dl:{track['id']}")
         ]])
@@ -773,7 +828,7 @@ async def on_inline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     loop = asyncio.get_event_loop()
     try:
-        tracks = await loop.run_in_executor(None, search_youtube, query_text, 5)
+        tracks = await loop.run_in_executor(None, search_music, query_text, 5)
     except Exception:
         return
 
