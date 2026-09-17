@@ -92,6 +92,7 @@ def search_youtube(query: str, max_results: int = MAX_RESULTS) -> list:
         "extract_flat": True,
         "default_search": "ytsearch",
         "noplaylist": True,
+        "extractor_args": {"youtube": ["player_client=android"]},
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         result = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
@@ -118,7 +119,7 @@ def get_video_info(video_id: str) -> dict:
     """Fetch single video metadata by ID (used for deep links)."""
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "extractor_args": {"youtube": ["player_client=android"]}}) as ydl:
             info = ydl.extract_info(url, download=False)
         return {
             "id":       video_id,
@@ -146,6 +147,7 @@ def download_audio(video_url: str, output_dir: str):
                                 "preferredcodec": "mp3", "preferredquality": "192"}],
             "quiet": False,
             "noplaylist": True,
+            "extractor_args": {"youtube": ["player_client=android"]},
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(video_url, download=True)
@@ -162,6 +164,7 @@ def download_audio(video_url: str, output_dir: str):
         "outtmpl": os.path.join(output_dir, "audio.%(ext)s"),
         "quiet": False,
         "noplaylist": True,
+        "extractor_args": {"youtube": ["player_client=android"]},
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
